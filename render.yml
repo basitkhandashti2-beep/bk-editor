@@ -1,0 +1,372 @@
+name: BK EDITOR Server Turbo render
+
+# Sent by BK EDITOR as a workflow_dispatch with one input: the tag of the
+# release that holds this job's files (audio, settings.json, maybe music).
+# Pipeline: probe -> parallel transcription chunks -> scene plan ->
+# parallel render chunks -> join + audio mix -> video.mp4 back on the
+# same release, where BK EDITOR's Download button picks it up.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_tag:
+        description: "Release tag that holds this job's files"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.p.outputs.chunks }}
+      length: ${{ steps.p.outputs.length }}
+    steps:
+      - name: Download the job files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p job
+          gh release download "$TAG" --repo "$REPO" --dir job
+          ls -la job
+      - id: p
+        name: Measure the audio and split it for parallel transcription
+        run: |
+          A=$(ls job/audio.* | head -n 1)
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$A")
+          python3 - "$DUR" <<'PYEOF'
+          import math, os, sys
+          dur = float(sys.argv[1])
+          n = max(1, min(6, math.ceil(dur / 450)))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("chunks=" + str(list(range(n))).replace(" ", "") + "\n")
+              f.write("length=%.3f\n" % (dur / n))
+          print("audio %.1fs -> %d transcription chunks" % (dur, n))
+          PYEOF
+
+  transcribe:
+    needs: probe
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: ${{ fromJson(needs.probe.outputs.chunks) }}
+    steps:
+      - name: Download the job files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p job
+          gh release download "$TAG" --repo "$REPO" --dir job
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the transcription engine
+        run: pip install --quiet faster-whisper
+      - name: Transcribe this chunk
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+          IDX: ${{ matrix.idx }}
+          LENGTH: ${{ needs.probe.outputs.length }}
+        run: |
+          A=$(ls job/audio.* | head -n 1)
+          START=$(python3 -c "print(float('$LENGTH') * int('$IDX'))")
+          echo "START_S=$START" >> "$GITHUB_ENV"
+          ffmpeg -y -v error -ss "$START" -t "$LENGTH" -i "$A" -vn -ac 1 -ar 16000 chunk.wav
+          python3 - <<'PYEOF'
+          import json, os
+          from faster_whisper import WhisperModel
+          idx = int(os.environ["IDX"]); start = float(os.environ["START_S"])
+          model = WhisperModel("small", device="cpu", compute_type="int8")
+          segments, info = model.transcribe("chunk.wav", beam_size=1, vad_filter=True)
+          out = [{"start": round(start + s.start, 2), "end": round(start + s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]
+          json.dump(out, open("seg-%d.json" % idx, "w"))
+          print(idx, "->", len(out), "segments")
+          PYEOF
+          gh release upload "$TAG" --repo "$REPO" "seg-${IDX}.json" --clobber
+
+  plan:
+    needs: transcribe
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.mk.outputs.chunks }}
+    steps:
+      - name: Download the job files (audio, settings, transcript chunks)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p job
+          gh release download "$TAG" --repo "$REPO" --dir job
+          ls -la job
+      - id: mk
+        name: Build the scene plan (15-30s scenes, Commons clips, chunks)
+        run: |
+          python3 - <<'PYEOF'
+          import glob, json, math, os, re, subprocess, sys, urllib.parse, urllib.request
+          S = json.load(open("job/settings.json"))
+          segs = []
+          if S.get("segments"):
+              segs = [{"start": float(x["start"]), "end": float(x["end"]), "text": str(x["text"])} for x in S["segments"]]
+          else:
+              for f in sorted(glob.glob("job/seg-*.json"), key=lambda p: int(re.search(r"seg-(\d+)", p).group(1))):
+                  segs += json.load(open(f))
+              segs.sort(key=lambda x: x["start"])
+          intro = float(S.get("introSeconds") or 0)
+          outro = float(S.get("outroSeconds") or 0)
+          if not segs and (S.get("script") or "").strip():
+              a = [f for f in os.listdir("job") if f.startswith("audio.")][0]
+              dur = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", "job/" + a]).decode().strip())
+              parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", S["script"]) if len(p.strip()) > 1] or [S["script"]]
+              tw = sum(max(1, len(p.split())) for p in parts) or 1
+              t = 0.0
+              for p in parts:
+                  d = dur * max(1, len(p.split())) / tw
+                  segs.append({"start": t, "end": t + d, "text": p}); t += d
+          if not segs:
+              print("No speech segments and no script - cannot plan"); sys.exit(1)
+          scenes = []
+          cur = None
+          for s in segs:
+              if cur is None:
+                  cur = {"start": s["start"], "end": s["end"], "texts": [s]}; continue
+              if (s["end"] - cur["start"]) <= 30.0:
+                  cur["texts"].append(s); cur["end"] = s["end"]
+              else:
+                  scenes.append(cur); cur = {"start": s["start"], "end": s["end"], "texts": [s]}
+          if cur: scenes.append(cur)
+          if len(scenes) > 1 and (scenes[-1]["end"] - scenes[-1]["start"]) < 8:
+              last = scenes.pop(); scenes[-1]["texts"] += last["texts"]; scenes[-1]["end"] = last["end"]
+          CATS = [
+            (["anger", "gussa", "temper"], "storm clouds", "https://upload.wikimedia.org/wikipedia/commons/transcoded/a/a0/Hail_thunderstorm_in_Romans-sur-Is%C3%A8re.webm/Hail_thunderstorm_in_Romans-sur-Is%C3%A8re.webm.240p.vp9.webm"),
+            (["sea", "ocean", "samandar", "waves"], "ocean waves", "https://upload.wikimedia.org/wikipedia/commons/transcoded/9/9b/Ocean_waves_at_L%C3%A6kjavik_beach%2C_Iceland.webm/Ocean_waves_at_L%C3%A6kjavik_beach%2C_Iceland.webm.480p.vp9.webm"),
+            (["mountain", "pahar", "climb"], "mountains fog", "https://upload.wikimedia.org/wikipedia/commons/transcoded/0/06/Fog_covering_mountain_time_lapse.webm/Fog_covering_mountain_time_lapse.webm.240p.vp9.webm"),
+            (["statue", "marble", "stoic", "philosoph"], "statue", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/d0/Inauguration_of_the_%22Tree_of_Hope%22_statue_donated_by_the_Italian_government_to_the_CEC_%28I-001548%29.webm/Inauguration_of_the_%22Tree_of_Hope%22_statue_donated_by_the_Italian_government_to_the_CEC_%28I-001548%29.webm.480p.vp9.webm"),
+            (["rain", "barish"], "rain", "https://upload.wikimedia.org/wikipedia/commons/transcoded/5/5f/Puddles_of_rain.webm/Puddles_of_rain.webm.1080p.vp9.webm"),
+            (["river", "darya"], "river", "https://upload.wikimedia.org/wikipedia/commons/transcoded/6/68/A_High_Current_Muddy_River.webm/A_High_Current_Muddy_River.webm.480p.vp9.webm"),
+            (["night", "raat", "candle"], "candle", "https://upload.wikimedia.org/wikipedia/commons/transcoded/7/7a/027_Lighting_And_Blowing_Of_A_Candle_%28Slow_Motion%29_Video_By_Giles_Laurent.webm/027_Lighting_And_Blowing_Of_A_Candle_%28Slow_Motion%29_Video_By_Giles_Laurent.webm.480p.vp9.webm"),
+            (["morning", "subah", "dawn", "sunrise"], "sunrise", "https://upload.wikimedia.org/wikipedia/commons/transcoded/0/02/Sunrise_from_mountains.webm/Sunrise_from_mountains.webm.480p.vp9.webm"),
+            (["road", "path", "journey", "safar"], "road mountains", "https://upload.wikimedia.org/wikipedia/commons/transcoded/4/47/Mountain_Road_at_Zojila_Pass.webm/Mountain_Road_at_Zojila_Pass.webm.1080p.vp9.webm"),
+            (["tree", "darakht"], "tree wind", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/df/Trees_blow_in_the_wind_during_the_2018_nor_easter.webm/Trees_blow_in_the_wind_during_the_2018_nor_easter.webm.240p.vp9.webm"),
+            (["book", "kitab", "read", "library"], "library", "https://upload.wikimedia.org/wikipedia/commons/transcoded/1/19/Reading_with_Dogs_%28955309%29.webm/Reading_with_Dogs_%28955309%29.webm.240p.vp9.webm"),
+            (["time", "waqt", "hourglass"], "hourglass", "https://upload.wikimedia.org/wikipedia/commons/transcoded/c/c6/Hourglass_-_tokyo_-_2015_11_17.webm/Hourglass_-_tokyo_-_2015_11_17.webm.240p.vp9.webm"),
+            (["death", "maut", "leaves"], "leaves", "https://upload.wikimedia.org/wikipedia/commons/transcoded/3/3c/Dead_Leaves_On_Ground.webm/Dead_Leaves_On_Ground.webm.480p.vp9.webm"),
+            (["desert", "registan"], "desert", "https://upload.wikimedia.org/wikipedia/commons/transcoded/2/27/A_Wide_Dry_Desert_Wash_at_Red_Rock_Canyon_NCA.webm/A_Wide_Dry_Desert_Wash_at_Red_Rock_Canyon_NCA.webm.480p.vp9.webm"),
+            (["snow", "winter", "barf"], "snow", "https://upload.wikimedia.org/wikipedia/commons/transcoded/7/71/Clean_monochrome_snowfall.webm/Clean_monochrome_snowfall.webm.240p.vp9.webm"),
+            (["fire", "aag"], "fire", "https://upload.wikimedia.org/wikipedia/commons/transcoded/c/cf/ABOedit2015-Video-Fire.webm/ABOedit2015-Video-Fire.webm.480p.vp9.webm"),
+            (["city", "sheher"], "street old town", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/d9/Old_Town_Funchal%2C_Madeira._Narrow_Restaurant_Street_With_Art_On_Doors_--_Nice_Walks.webm/Old_Town_Funchal%2C_Madeira._Narrow_Restaurant_Street_With_Art_On_Doors_--_Nice_Walks.webm.240p.vp9.webm"),
+            (["alone", "lonely", "akela"], "walking path", "https://upload.wikimedia.org/wikipedia/commons/transcoded/1/1a/Trail_walking_at_dusk.webm/Trail_walking_at_dusk.webm.240p.vp9.webm"),
+            (["work", "mehnat", "craftsman", "labour"], "workshop", "https://upload.wikimedia.org/wikipedia/commons/transcoded/b/b3/Blacksmith_Working_at_M%C3%B6hk%C3%B6n_Ruukki.webm/Blacksmith_Working_at_M%C3%B6hk%C3%B6n_Ruukki.webm.240p.vp9.webm"),
+          ]
+          FALLBACKS = [c[2] for c in CATS]
+          STOP = set("the and for with that this from have will would your you are was were been its it is in on at to of a an or by as so if then than too very just".split())
+          def commons_clip(query):
+              q = urllib.parse.urlencode({"action": "query", "format": "json", "generator": "search", "gsrsearch": "filetype:video " + query, "gsrnamespace": 6, "gsrlimit": 5, "prop": "imageinfo", "iiprop": "url|derivatives"})
+              try:
+                  req = urllib.request.Request("https://commons.wikimedia.org/w/api.php?" + q, headers={"User-Agent": "BKEditorServerTurbo/1.0"})
+                  data = json.load(urllib.request.urlopen(req, timeout=30))
+              except Exception as e:
+                  print("commons search failed:", e); return None
+              pages = (data.get("query") or {}).get("pages") or {}
+              for p in pages.values():
+                  for info in p.get("imageinfo") or []:
+                      ders = [d for d in (info.get("derivatives") or []) if d.get("src") and (d.get("width") or 9999) <= 1280]
+                      if ders:
+                          ders.sort(key=lambda d: abs((d.get("width") or 0) - 720))
+                          return ders[0]["src"]
+              return None
+          for i, sc in enumerate(scenes):
+              text = " ".join(t["text"] for t in sc["texts"]).lower()
+              clip = None; query = ""
+              for keys, q, url in CATS:
+                  if any(k in text for k in keys):
+                      query = q; clip = url; break
+              if not clip:
+                  words = [w for w in re.findall(r"[a-z]{3,}", text) if w not in STOP]
+                  query = " ".join(words[:2]) or "landscape"
+                  clip = commons_clip(query)
+              if not clip:
+                  clip = FALLBACKS[i % len(FALLBACKS)]
+              sc["clip"] = clip; sc["query"] = query
+          caps = [{"start": round(intro + s["start"], 2), "end": round(intro + max(s["end"], s["start"] + 0.5), 2), "text": s["text"]} for s in segs]
+          out_scenes = []
+          if intro > 0:
+              out_scenes.append({"kind": "card", "start": 0, "dur": intro, "title": S.get("channelName") or "", "seed": 7})
+          for i, sc in enumerate(scenes):
+              out_scenes.append({"kind": "scene", "start": round(intro + sc["start"], 2), "dur": round(max(1.2, sc["end"] - sc["start"]), 2), "clip": sc["clip"], "query": sc["query"], "seed": 1000 + i * 37})
+          total = intro + max(s["end"] for s in segs)
+          if outro > 0:
+              out_scenes.append({"kind": "card", "start": round(total, 2), "dur": outro, "title": "Thanks for watching", "seed": 9})
+              total += outro
+          chunks = []; cur = []; acc = 0.0
+          for idx, sc in enumerate(out_scenes):
+              if cur and acc + sc["dur"] > 300:
+                  chunks.append(cur); cur = []; acc = 0.0
+              cur.append(idx); acc += sc["dur"]
+          if cur: chunks.append(cur)
+          plan = {"width": S["width"], "height": S["height"], "fps": S["fps"], "total": round(total, 2), "look": S.get("look") or "bw", "captionsOn": bool(S.get("captionsOn", True)), "captionSize": S.get("captionSize") or 30, "audioStart": intro, "scenes": out_scenes, "captions": caps, "chunks": chunks}
+          json.dump(plan, open("plan.json", "w"))
+          def ts(t):
+              return "%02d:%02d:%02d,%03d" % (int(t // 3600), int(t // 60) % 60, int(t) % 60, int(round((t - int(t)) * 1000)))
+          with open("subtitles.srt", "w") as f:
+              for i, c in enumerate(caps):
+                  f.write("%d\n%s --> %s\n%s\n\n" % (i + 1, ts(c["start"]), ts(c["end"]), c["text"]))
+          print("plan:", len(out_scenes), "scenes,", len(chunks), "render chunks, total %.1fs" % total)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("chunks=" + str(list(range(len(chunks)))).replace(" ", "") + "\n")
+          PYEOF
+      - name: Save the plan and subtitles on the job release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" --repo "$REPO" plan.json subtitles.srt --clobber
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: ${{ fromJson(needs.plan.outputs.chunks) }}
+    steps:
+      - name: Download the job files (including the plan)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p job
+          gh release download "$TAG" --repo "$REPO" --dir job
+      - name: Render this chunk of the video
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+          IDX: ${{ matrix.idx }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core > /dev/null
+          python3 - <<'PYEOF'
+          import hashlib, json, os, subprocess, textwrap, urllib.request
+          plan = json.load(open("job/plan.json"))
+          idx = int(os.environ["IDX"])
+          W, H, FPS = plan["width"], plan["height"], plan["fps"]
+          FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          def cap_filters(scene_start, dur):
+              fs = []
+              if not plan.get("captionsOn"): return fs
+              n = 0
+              for c in plan["captions"]:
+                  a = c["start"] - scene_start; b = c["end"] - scene_start
+                  if b <= 0 or a >= dur: continue
+                  a = max(0.0, a); b = min(dur, b)
+                  fn = "cap_%d_%d.txt" % (idx, n)
+                  with open(fn, "w") as f: f.write("\n".join(textwrap.wrap(c["text"], 42)[:3]))
+                  size = max(18, int(int(plan.get("captionSize", 30)) * (W / 1280) * 1.5))
+                  fs.append("drawtext=fontfile=%s:textfile=%s:fontsize=%d:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-text_h-%d:enable='between(t,%.2f,%.2f)'" % (FONT, fn, size, int(H * 0.045), a, b))
+                  n += 1
+              return fs
+          def visual_filters(sc, with_source):
+              vf = []
+              if with_source:
+                  vf += ["scale=%d:%d:force_original_aspect_ratio=increase" % (W, H), "crop=%d:%d" % (W, H)]
+              vf += ["fps=%d" % FPS, "setsar=1"]
+              if plan.get("look") == "bw": vf.append("hue=s=0")
+              seed = sc.get("seed", 0)
+              if seed % 2: vf.append("hflip")
+              vf.append("eq=brightness=%.3f:contrast=1.05" % (((seed % 5) - 2) * 0.015))
+              vf += cap_filters(sc["start"], sc["dur"])
+              return ",".join(vf)
+          os.makedirs("parts", exist_ok=True)
+          parts = []
+          for si in plan["chunks"][idx]:
+              sc = plan["scenes"][si]; dur = sc["dur"]; out = "parts/%03d.mp4" % si
+              if sc["kind"] == "card":
+                  title = (sc.get("title") or "").strip()
+                  if title:
+                      fn = "card_%d.txt" % si
+                      with open(fn, "w") as f: f.write(title)
+                      vf = "drawtext=fontfile=%s:textfile=%s:fontsize=%d:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2" % (FONT, fn, int(W * 0.045))
+                  else:
+                      vf = "null"
+                  cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=%d:d=%.2f" % (W, H, FPS, dur), "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
+              else:
+                  local = None
+                  url = sc.get("clip")
+                  if url:
+                      cand = "clip_" + hashlib.md5(url.encode()).hexdigest()[:12] + ".webm"
+                      ok = False
+                      for attempt in range(3):
+                          try:
+                              req = urllib.request.Request(url, headers={"User-Agent": "BKEditorServerTurbo/1.0"})
+                              with urllib.request.urlopen(req, timeout=120) as r, open(cand, "wb") as f:
+                                  while True:
+                                      b = r.read(1 << 20)
+                                      if not b: break
+                                      f.write(b)
+                              if os.path.getsize(cand) > 10000: ok = True; break
+                          except Exception as e:
+                              print("clip download failed:", e)
+                      if ok: local = cand
+                  if local:
+                      cmd = ["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-ss", str(sc.get("seed", 0) % 15), "-t", "%.2f" % dur, "-i", local, "-vf", visual_filters(sc, True), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
+                  else:
+                      cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=%d:d=%.2f" % (W, H, FPS, dur), "-vf", visual_filters(sc, False), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
+              subprocess.run(cmd, check=True)
+              parts.append(out)
+          with open("list.txt", "w") as f:
+              for p in parts: f.write("file '%s'\n" % p)
+          subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "chunk-%d.mp4" % idx], check=True)
+          print("chunk", idx, "rendered:", len(parts), "scenes")
+          PYEOF
+          gh release upload "$TAG" --repo "$REPO" "chunk-${IDX}.mp4" --clobber
+
+  finish:
+    needs: render
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download everything (chunks, audio, music, plan, settings)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p job
+          gh release download "$TAG" --repo "$REPO" --dir job
+          ls -la job
+      - name: Join the chunks, mix the audio, publish video.mp4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.job_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          python3 - <<'PYEOF'
+          import glob, re
+          files = sorted(glob.glob("job/chunk-*.mp4"), key=lambda p: int(re.search(r"chunk-(\d+)", p).group(1)))
+          with open("clist.txt", "w") as f:
+              for p in files: f.write("file '%s'\n" % p)
+          print(len(files), "chunks to join")
+          PYEOF
+          ffmpeg -y -v error -f concat -safe 0 -i clist.txt -c copy silent.mp4
+          A=$(ls job/audio.* | head -n 1)
+          MS=$(python3 -c "import json; print(int(json.load(open('job/plan.json'))['audioStart'] * 1000))")
+          TOTAL=$(python3 -c "import json; print(json.load(open('job/plan.json'))['total'])")
+          MUSIC=$(ls job/music.* 2>/dev/null | head -n 1 || true)
+          if [ -n "$MUSIC" ]; then
+            VOL=$(python3 -c "import json; print(json.load(open('job/settings.json')).get('musicGain', 0.16))")
+            ffmpeg -y -v error -i silent.mp4 -i "$A" -stream_loop -1 -i "$MUSIC" -filter_complex "[1:a]adelay=${MS}:all=1[voice];[2:a]volume=${VOL}[mus];[voice][mus]amix=inputs=2:duration=first:dropout_transition=0[a]" -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
+          else
+            ffmpeg -y -v error -i silent.mp4 -i "$A" -filter_complex "[1:a]adelay=${MS}:all=1[voice]" -map 0:v -map "[voice]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
+          fi
+          ls -la video.mp4
+          gh release upload "$TAG" --repo "$REPO" video.mp4 --clobber

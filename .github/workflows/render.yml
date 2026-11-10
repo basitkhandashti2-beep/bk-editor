@@ -1,6 +1,11 @@
 name: BK EDITOR Server Turbo render
 
-# Workflow version: 3 (2026-11-10) — every job that uses ffmpeg/ffprobe
+# Workflow version: 4 (2026-11-10) — version 3's transcribe step wrote
+# START_S to $GITHUB_ENV, which only reaches LATER steps, so the Python
+# in the SAME step died instantly with KeyError: 'START_S' (all 6 chunks,
+# run 42758132182). Version 4 exports START_S inside the step's own shell
+# and the Python also falls back to LENGTH x IDX from the step env.
+# Version 3 note — every job that uses ffmpeg/ffprobe
 # installs it first. GitHub's ubuntu-latest runners do NOT ship ffmpeg
 # or ffprobe (checked against GitHub's own runner-image software list:
 # only MediaInfo is listed, no ffmpeg) — version 2 called ffprobe in
@@ -129,12 +134,12 @@ jobs:
           A=$(ls job/audio.* 2>/dev/null | grep -v '\.part-' | head -n 1 || true)
           if [ -z "$A" ] || [ ! -f "$A" ]; then echo "::error::No joined audio file found in job/ for transcription chunk $IDX."; ls -la job || true; exit 1; fi
           START=$(python3 -c "print(float('$LENGTH') * int('$IDX'))")
-          echo "START_S=$START" >> "$GITHUB_ENV"
+          export START_S="$START"
           ffmpeg -y -v error -ss "$START" -t "$LENGTH" -i "$A" -vn -ac 1 -ar 16000 chunk.wav
           python3 - <<'PYEOF'
           import json, os
           from faster_whisper import WhisperModel
-          idx = int(os.environ["IDX"]); start = float(os.environ["START_S"])
+          idx = int(os.environ["IDX"]); start = float(os.environ.get("START_S") or (float(os.environ["LENGTH"]) * idx))
           model = WhisperModel("small", device="cpu", compute_type="int8")
           segments, info = model.transcribe("chunk.wav", beam_size=1, vad_filter=True)
           out = [{"start": round(start + s.start, 2), "end": round(start + s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]

@@ -1,5 +1,14 @@
 name: BK EDITOR Server Turbo render
 
+# Workflow version: 3 (2026-11-10) — every job that uses ffmpeg/ffprobe
+# installs it first. GitHub's ubuntu-latest runners do NOT ship ffmpeg
+# or ffprobe (checked against GitHub's own runner-image software list:
+# only MediaInfo is listed, no ffmpeg) — version 2 called ffprobe in
+# the probe job without installing it, so the first real job died at
+# "Measure the audio" in seconds with "ffprobe: command not found",
+# and the transcribe jobs would have died the same way on ffmpeg.
+# If your repo still holds an older copy, replace render.yml with
+# this one (Setup → Copy workflow file) before the next Generate.
 # Sent by BK EDITOR as a workflow_dispatch with one input: the job tag.
 # The job's files (audio in small pieces, settings.json, maybe music)
 # are committed by BK EDITOR into bk-jobs/<job_tag>/ in this repo —
@@ -54,11 +63,20 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           gh release create "$TAG" --repo "$REPO" --prerelease --title "BK EDITOR job $TAG" --notes "BK EDITOR Server Turbo job: intermediate files and the finished video.mp4 live here. The job's input files are in the bk-jobs folder of this repo. Delete both any time." || gh release view "$TAG" --repo "$REPO" > /dev/null
+      - name: Install ffmpeg (ffprobe is NOT preinstalled on GitHub runners)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          ffprobe -version | head -n 1
+          ffmpeg -version | head -n 1
       - id: p
         name: Measure the audio and split it for parallel transcription
         run: |
-          A=$(ls job/audio.* | head -n 1)
-          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$A")
+          A=$(ls job/audio.* 2>/dev/null | grep -v '\.part-' | head -n 1 || true)
+          if [ -z "$A" ] || [ ! -f "$A" ]; then echo "::error::No joined audio file found in job/ — the files that did arrive are listed below. The join step above (bk-jobs pieces) needs checking."; ls -la job || true; exit 1; fi
+          echo "Measuring $A ($(stat -c%s "$A") bytes)"
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$A" || true)
+          if ! printf '%s' "$DUR" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then echo "::error::ffprobe could not read a duration from $A (ffprobe said: '$DUR'). The audio file may be corrupt, empty, or in a format ffmpeg cannot read — its probe details follow."; ffprobe -v error -show_format -show_streams "$A" || true; exit 1; fi
+          echo "Duration: ${DUR}s"
           python3 - "$DUR" <<'PYEOF'
           import math, os, sys
           dur = float(sys.argv[1])
@@ -94,6 +112,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install ffmpeg (NOT preinstalled on GitHub runners — the chunk cut below needs it)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          ffmpeg -version | head -n 1
       - name: Install the transcription engine
         run: pip install --quiet faster-whisper
       - name: Transcribe this chunk
@@ -104,7 +126,8 @@ jobs:
           IDX: ${{ matrix.idx }}
           LENGTH: ${{ needs.probe.outputs.length }}
         run: |
-          A=$(ls job/audio.* | head -n 1)
+          A=$(ls job/audio.* 2>/dev/null | grep -v '\.part-' | head -n 1 || true)
+          if [ -z "$A" ] || [ ! -f "$A" ]; then echo "::error::No joined audio file found in job/ for transcription chunk $IDX."; ls -la job || true; exit 1; fi
           START=$(python3 -c "print(float('$LENGTH') * int('$IDX'))")
           echo "START_S=$START" >> "$GITHUB_ENV"
           ffmpeg -y -v error -ss "$START" -t "$LENGTH" -i "$A" -vn -ac 1 -ar 16000 chunk.wav
@@ -143,6 +166,10 @@ jobs:
           done
           gh release download "$TAG" --repo "$REPO" --dir job --clobber
           ls -la job
+      - name: Install ffmpeg (NOT preinstalled on GitHub runners — the plan step below may call ffprobe)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          ffprobe -version | head -n 1
       - id: mk
         name: Build the scene plan (15-30s scenes, Commons clips, chunks)
         run: |
@@ -159,7 +186,7 @@ jobs:
           intro = float(S.get("introSeconds") or 0)
           outro = float(S.get("outroSeconds") or 0)
           if not segs and (S.get("script") or "").strip():
-              a = [f for f in os.listdir("job") if f.startswith("audio.")][0]
+              a = [f for f in os.listdir("job") if f.startswith("audio.") and ".part-" not in f][0]
               dur = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", "job/" + a]).decode().strip())
               parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", S["script"]) if len(p.strip()) > 1] or [S["script"]]
               tw = sum(max(1, len(p.split())) for p in parts) or 1
@@ -401,10 +428,11 @@ jobs:
           print(len(files), "chunks to join")
           PYEOF
           ffmpeg -y -v error -f concat -safe 0 -i clist.txt -c copy silent.mp4
-          A=$(ls job/audio.* | head -n 1)
+          A=$(ls job/audio.* 2>/dev/null | grep -v '\.part-' | head -n 1 || true)
+          if [ -z "$A" ] || [ ! -f "$A" ]; then echo "::error::No joined audio file found in job/ for the final mix."; ls -la job || true; exit 1; fi
+          MUSIC=$(ls job/music.* 2>/dev/null | grep -v '\.part-' | head -n 1 || true)
           MS=$(python3 -c "import json; print(int(json.load(open('job/plan.json'))['audioStart'] * 1000))")
           TOTAL=$(python3 -c "import json; print(json.load(open('job/plan.json'))['total'])")
-          MUSIC=$(ls job/music.* 2>/dev/null | head -n 1 || true)
           if [ -n "$MUSIC" ]; then
             VOL=$(python3 -c "import json; print(json.load(open('job/settings.json')).get('musicGain', 0.16))")
             ffmpeg -y -v error -i silent.mp4 -i "$A" -stream_loop -1 -i "$MUSIC" -filter_complex "[1:a]adelay=${MS}:all=1[voice];[2:a]volume=${VOL}[mus];[voice][mus]amix=inputs=2:duration=first:dropout_transition=0[a]" -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4

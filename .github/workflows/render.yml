@@ -1,6 +1,19 @@
 name: BK EDITOR Server Turbo render
 
-# Workflow version: 5 (2026-11-10) — version 4's transcribe step got one
+# Workflow version: 6 (2026-11-11) — version 5 rendered end-to-end
+# (run #8) but the video repeated a handful of clips (76 scenes, only
+# 16 different clips, one statue clip 22 times), used blurry 240p
+# sources, and showed box glyphs at caption line ends. Version 6
+# rewrites the scene plan: every scene searches Commons live, only
+# 640-1280px derivatives qualify (never 240p), a title-relevance check
+# applies, and one clip may serve at most 2 scenes in the whole video.
+# Clip data comes from the videoinfo API prop: the imageinfo prop
+# silently returns no derivatives at all (that is also why v5's live
+# search kept missing and its fixed fallback pool did the damage).
+# Captions are drawn one line per drawtext (single-line text files),
+# which removes the end-of-line box glyph the multi-line file showed
+# on the runners. The default look is now colour, not black & white.
+# Version 5 note — version 4's transcribe step got one
 # step further and died inside faster-whisper's own audio decoding:
 # TypeError: open() got an unexpected keyword argument 'metadata_errors'
 # (faster-whisper decodes file paths through PyAV, whose av.open arguments
@@ -147,11 +160,14 @@ jobs:
           import json, os, wave
           import numpy as np
           from faster_whisper import WhisperModel
+          def load_wav_16k_mono(path):
+              w = wave.open(path, "rb")
+              assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2), "chunk.wav is not 16kHz mono int16"
+              data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+              w.close()
+              return data
           idx = int(os.environ["IDX"]); start = float(os.environ.get("START_S") or (float(os.environ["LENGTH"]) * idx))
-          w = wave.open("chunk.wav", "rb")
-          assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2), "chunk.wav is not 16kHz mono int16"
-          audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-          w.close()
+          audio = load_wav_16k_mono("chunk.wav")
           model = WhisperModel(os.environ.get("BK_WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
           segments, info = model.transcribe(audio, beam_size=1, vad_filter=True)
           out = [{"start": round(start + s.start, 2), "end": round(start + s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]
@@ -191,7 +207,7 @@ jobs:
         name: Build the scene plan (15-30s scenes, Commons clips, chunks)
         run: |
           python3 - <<'PYEOF'
-          import glob, json, math, os, re, subprocess, sys, urllib.parse, urllib.request
+          import glob, json, math, os, re, subprocess, sys, time, urllib.parse, urllib.request
           S = json.load(open("job/settings.json"))
           segs = []
           if S.get("segments"):
@@ -225,57 +241,99 @@ jobs:
           if cur: scenes.append(cur)
           if len(scenes) > 1 and (scenes[-1]["end"] - scenes[-1]["start"]) < 8:
               last = scenes.pop(); scenes[-1]["texts"] += last["texts"]; scenes[-1]["end"] = last["end"]
-          CATS = [
-            (["anger", "gussa", "temper"], "storm clouds", "https://upload.wikimedia.org/wikipedia/commons/transcoded/a/a0/Hail_thunderstorm_in_Romans-sur-Is%C3%A8re.webm/Hail_thunderstorm_in_Romans-sur-Is%C3%A8re.webm.240p.vp9.webm"),
-            (["sea", "ocean", "samandar", "waves"], "ocean waves", "https://upload.wikimedia.org/wikipedia/commons/transcoded/9/9b/Ocean_waves_at_L%C3%A6kjavik_beach%2C_Iceland.webm/Ocean_waves_at_L%C3%A6kjavik_beach%2C_Iceland.webm.480p.vp9.webm"),
-            (["mountain", "pahar", "climb"], "mountains fog", "https://upload.wikimedia.org/wikipedia/commons/transcoded/0/06/Fog_covering_mountain_time_lapse.webm/Fog_covering_mountain_time_lapse.webm.240p.vp9.webm"),
-            (["statue", "marble", "stoic", "philosoph"], "statue", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/d0/Inauguration_of_the_%22Tree_of_Hope%22_statue_donated_by_the_Italian_government_to_the_CEC_%28I-001548%29.webm/Inauguration_of_the_%22Tree_of_Hope%22_statue_donated_by_the_Italian_government_to_the_CEC_%28I-001548%29.webm.480p.vp9.webm"),
-            (["rain", "barish"], "rain", "https://upload.wikimedia.org/wikipedia/commons/transcoded/5/5f/Puddles_of_rain.webm/Puddles_of_rain.webm.1080p.vp9.webm"),
-            (["river", "darya"], "river", "https://upload.wikimedia.org/wikipedia/commons/transcoded/6/68/A_High_Current_Muddy_River.webm/A_High_Current_Muddy_River.webm.480p.vp9.webm"),
-            (["night", "raat", "candle"], "candle", "https://upload.wikimedia.org/wikipedia/commons/transcoded/7/7a/027_Lighting_And_Blowing_Of_A_Candle_%28Slow_Motion%29_Video_By_Giles_Laurent.webm/027_Lighting_And_Blowing_Of_A_Candle_%28Slow_Motion%29_Video_By_Giles_Laurent.webm.480p.vp9.webm"),
-            (["morning", "subah", "dawn", "sunrise"], "sunrise", "https://upload.wikimedia.org/wikipedia/commons/transcoded/0/02/Sunrise_from_mountains.webm/Sunrise_from_mountains.webm.480p.vp9.webm"),
-            (["road", "path", "journey", "safar"], "road mountains", "https://upload.wikimedia.org/wikipedia/commons/transcoded/4/47/Mountain_Road_at_Zojila_Pass.webm/Mountain_Road_at_Zojila_Pass.webm.1080p.vp9.webm"),
-            (["tree", "darakht"], "tree wind", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/df/Trees_blow_in_the_wind_during_the_2018_nor_easter.webm/Trees_blow_in_the_wind_during_the_2018_nor_easter.webm.240p.vp9.webm"),
-            (["book", "kitab", "read", "library"], "library", "https://upload.wikimedia.org/wikipedia/commons/transcoded/1/19/Reading_with_Dogs_%28955309%29.webm/Reading_with_Dogs_%28955309%29.webm.240p.vp9.webm"),
-            (["time", "waqt", "hourglass"], "hourglass", "https://upload.wikimedia.org/wikipedia/commons/transcoded/c/c6/Hourglass_-_tokyo_-_2015_11_17.webm/Hourglass_-_tokyo_-_2015_11_17.webm.240p.vp9.webm"),
-            (["death", "maut", "leaves"], "leaves", "https://upload.wikimedia.org/wikipedia/commons/transcoded/3/3c/Dead_Leaves_On_Ground.webm/Dead_Leaves_On_Ground.webm.480p.vp9.webm"),
-            (["desert", "registan"], "desert", "https://upload.wikimedia.org/wikipedia/commons/transcoded/2/27/A_Wide_Dry_Desert_Wash_at_Red_Rock_Canyon_NCA.webm/A_Wide_Dry_Desert_Wash_at_Red_Rock_Canyon_NCA.webm.480p.vp9.webm"),
-            (["snow", "winter", "barf"], "snow", "https://upload.wikimedia.org/wikipedia/commons/transcoded/7/71/Clean_monochrome_snowfall.webm/Clean_monochrome_snowfall.webm.240p.vp9.webm"),
-            (["fire", "aag"], "fire", "https://upload.wikimedia.org/wikipedia/commons/transcoded/c/cf/ABOedit2015-Video-Fire.webm/ABOedit2015-Video-Fire.webm.480p.vp9.webm"),
-            (["city", "sheher"], "street old town", "https://upload.wikimedia.org/wikipedia/commons/transcoded/d/d9/Old_Town_Funchal%2C_Madeira._Narrow_Restaurant_Street_With_Art_On_Doors_--_Nice_Walks.webm/Old_Town_Funchal%2C_Madeira._Narrow_Restaurant_Street_With_Art_On_Doors_--_Nice_Walks.webm.240p.vp9.webm"),
-            (["alone", "lonely", "akela"], "walking path", "https://upload.wikimedia.org/wikipedia/commons/transcoded/1/1a/Trail_walking_at_dusk.webm/Trail_walking_at_dusk.webm.240p.vp9.webm"),
-            (["work", "mehnat", "craftsman", "labour"], "workshop", "https://upload.wikimedia.org/wikipedia/commons/transcoded/b/b3/Blacksmith_Working_at_M%C3%B6hk%C3%B6n_Ruukki.webm/Blacksmith_Working_at_M%C3%B6hk%C3%B6n_Ruukki.webm.240p.vp9.webm"),
+          HINTS = [
+            (["anger", "gussa", "temper"], "storm clouds"),
+            (["sea", "ocean", "samandar", "waves"], "ocean waves"),
+            (["mountain", "pahar", "climb"], "mountains fog"),
+            (["statue", "marble", "philosoph"], "statue"),
+            (["rain", "barish"], "rain"),
+            (["river", "darya"], "river"),
+            (["night", "raat", "candle"], "candle"),
+            (["morning", "subah", "dawn", "sunrise"], "sunrise"),
+            (["road", "path", "journey", "safar"], "road"),
+            (["tree", "darakht"], "tree wind"),
+            (["book", "kitab", "read", "library"], "library"),
+            (["time", "waqt", "hourglass"], "hourglass"),
+            (["death", "maut", "leaves"], "falling leaves"),
+            (["desert", "registan"], "desert"),
+            (["snow", "winter", "barf"], "snowfall"),
+            (["fire", "aag"], "fire flames"),
+            (["city", "sheher"], "city street"),
+            (["alone", "lonely", "akela"], "walking alone"),
+            (["work", "mehnat", "craftsman", "labour"], "blacksmith workshop"),
+            (["cook", "khana", "kitchen"], "cooking kitchen"),
+            (["garden", "bagh", "flower"], "garden flowers"),
+            (["train", "railway"], "train journey"),
+            (["market", "bazaar"], "market"),
+            (["children", "bachay", "school"], "children playing"),
+            (["horse", "ghora"], "horses"),
+            (["bird", "parinda"], "birds flying"),
+            (["wind", "hawa"], "wind trees"),
+            (["sky", "aasmaan", "clouds", "badal"], "clouds sky"),
+            (["forest", "jungle", "jangal"], "forest"),
+            (["village", "gaon"], "village"),
           ]
-          FALLBACKS = [c[2] for c in CATS]
           STOP = set("the and for with that this from have will would your you are was were been its it is in on at to of a an or by as so if then than too very just".split())
-          def commons_clip(query):
-              q = urllib.parse.urlencode({"action": "query", "format": "json", "generator": "search", "gsrsearch": "filetype:video " + query, "gsrnamespace": 6, "gsrlimit": 5, "prop": "imageinfo", "iiprop": "url|derivatives"})
-              try:
-                  req = urllib.request.Request("https://commons.wikimedia.org/w/api.php?" + q, headers={"User-Agent": "BKEditorServerTurbo/1.0"})
-                  data = json.load(urllib.request.urlopen(req, timeout=30))
-              except Exception as e:
-                  print("commons search failed:", e); return None
-              pages = (data.get("query") or {}).get("pages") or {}
-              for p in pages.values():
-                  for info in p.get("imageinfo") or []:
-                      ders = [d for d in (info.get("derivatives") or []) if d.get("src") and (d.get("width") or 9999) <= 1280]
-                      if ders:
-                          ders.sort(key=lambda d: abs((d.get("width") or 0) - 720))
-                          return ders[0]["src"]
-              return None
+          POOLS = {}
+          USED = {}
+          MAX_USE = 2
+          def title_words(t):
+              return set(w for w in re.findall(r"[a-z0-9]{3,}", (t or "").lower().replace("file:", " ")))
+          def best_derivative(info):
+              best = None
+              for d in info.get("derivatives") or []:
+                  src = d.get("src") or ""
+                  w = d.get("width") or 0
+                  if not src.endswith(".webm") or w < 640 or w > 1280: continue
+                  if best is None or w > (best.get("width") or 0): best = d
+              return best
+          def commons_pool(query):
+              if query in POOLS: return POOLS[query]
+              pool = []
+              q = urllib.parse.urlencode({"action": "query", "format": "json", "generator": "search", "gsrsearch": "filetype:video " + query, "gsrnamespace": 6, "gsrlimit": 20, "prop": "videoinfo", "viprop": "url|derivatives|size"})
+              data = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request("https://commons.wikimedia.org/w/api.php?" + q, headers={"User-Agent": "BKEditorServerTurbo/1.0"})
+                      data = json.load(urllib.request.urlopen(req, timeout=30)); break
+                  except Exception as e:
+                      print("commons search failed (try", attempt + 1, "):", e); time.sleep(2 + attempt * 3)
+              if data:
+                  pages = (data.get("query") or {}).get("pages") or {}
+                  qw = set(w for w in query.lower().split() if len(w) >= 3)
+                  for p in sorted(pages.values(), key=lambda p: p.get("index", 999)):
+                      for info in p.get("videoinfo") or []:
+                          d = best_derivative(info)
+                          if not d: continue
+                          pool.append({"key": (p.get("title") or d["src"]).lower(), "src": d["src"], "width": d.get("width") or 0, "relevant": bool(qw & title_words(p.get("title")))})
+              POOLS[query] = pool
+              return pool
+          def pick_clip(queries):
+              for query in queries:
+                  if not query: continue
+                  pool = commons_pool(query)
+                  usable = [c for c in pool if USED.get(c["key"], 0) < MAX_USE]
+                  if not usable: continue
+                  usable.sort(key=lambda c: (0 if c["relevant"] else 1, USED.get(c["key"], 0), 1 if "360" in c["key"] else 0, -c["width"]))
+                  chosen = usable[0]
+                  USED[chosen["key"]] = USED.get(chosen["key"], 0) + 1
+                  return chosen["src"], query
+              return "", queries[0] if queries else ""
           for i, sc in enumerate(scenes):
               text = " ".join(t["text"] for t in sc["texts"]).lower()
-              clip = None; query = ""
-              for keys, q, url in CATS:
-                  if any(k in text for k in keys):
-                      query = q; clip = url; break
-              if not clip:
-                  words = [w for w in re.findall(r"[a-z]{3,}", text) if w not in STOP]
-                  query = " ".join(words[:2]) or "landscape"
-                  clip = commons_clip(query)
-              if not clip:
-                  clip = FALLBACKS[i % len(FALLBACKS)]
+              hint = ""
+              for keys, q in HINTS:
+                  if any(re.search(r"\b" + re.escape(k) + r"\b", text) for k in keys): hint = q; break
+              words = [w for w in re.findall(r"[a-z]{3,}", text) if w not in STOP]
+              queries = []
+              if hint: queries.append(hint)
+              if len(words) >= 2: queries.append(" ".join(words[:2]))
+              if words: queries.append(words[0])
+              if len(words) >= 3: queries.append(" ".join(words[1:3]))
+              queries.append("nature landscape" if i % 2 == 0 else "city life")
+              clip, query = pick_clip(queries)
               sc["clip"] = clip; sc["query"] = query
+          print("clip plan: %d scenes, %d different clips, most-used clip x%d, %d scenes without a clip" % (len(scenes), len(USED), max(USED.values()) if USED else 0, sum(1 for sc in scenes if not sc["clip"])))
           caps = [{"start": round(intro + s["start"], 2), "end": round(intro + max(s["end"], s["start"] + 0.5), 2), "text": s["text"]} for s in segs]
           out_scenes = []
           if intro > 0:
@@ -292,7 +350,7 @@ jobs:
                   chunks.append(cur); cur = []; acc = 0.0
               cur.append(idx); acc += sc["dur"]
           if cur: chunks.append(cur)
-          plan = {"width": S["width"], "height": S["height"], "fps": S["fps"], "total": round(total, 2), "look": S.get("look") or "bw", "captionsOn": bool(S.get("captionsOn", True)), "captionSize": S.get("captionSize") or 30, "audioStart": intro, "scenes": out_scenes, "captions": caps, "chunks": chunks}
+          plan = {"width": S["width"], "height": S["height"], "fps": S["fps"], "total": round(total, 2), "look": S.get("look") or "color", "captionsOn": bool(S.get("captionsOn", True)), "captionSize": S.get("captionSize") or 30, "audioStart": intro, "scenes": out_scenes, "captions": caps, "chunks": chunks}
           json.dump(plan, open("plan.json", "w"))
           def ts(t):
               return "%02d:%02d:%02d,%03d" % (int(t // 3600), int(t // 60) % 60, int(t) % 60, int(round((t - int(t)) * 1000)))
@@ -340,18 +398,28 @@ jobs:
           idx = int(os.environ["IDX"])
           W, H, FPS = plan["width"], plan["height"], plan["fps"]
           FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          def clean_text(t):
+              t = (t or "").replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("—", "-").replace("–", "-").replace("…", "...").replace(" ", " ")
+              return "".join(ch for ch in t if 32 <= ord(ch) < 127).strip()
           def cap_filters(scene_start, dur):
               fs = []
               if not plan.get("captionsOn"): return fs
               n = 0
+              size = max(18, int(int(plan.get("captionSize", 30)) * (W / 1280) * 1.5))
+              lh = int(size * 1.25)
+              margin = int(H * 0.045)
               for c in plan["captions"]:
                   a = c["start"] - scene_start; b = c["end"] - scene_start
                   if b <= 0 or a >= dur: continue
                   a = max(0.0, a); b = min(dur, b)
-                  fn = "cap_%d_%d.txt" % (idx, n)
-                  with open(fn, "w") as f: f.write("\n".join(textwrap.wrap(c["text"], 42)[:3]))
-                  size = max(18, int(int(plan.get("captionSize", 30)) * (W / 1280) * 1.5))
-                  fs.append("drawtext=fontfile=%s:textfile=%s:fontsize=%d:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-text_h-%d:enable='between(t,%.2f,%.2f)'" % (FONT, fn, size, int(H * 0.045), a, b))
+                  lines = textwrap.wrap(clean_text(c["text"]), 42)[:3]
+                  if not lines: continue
+                  top = H - margin - len(lines) * lh
+                  for li, line in enumerate(lines):
+                      fn = "cap_%d_%d_%d.txt" % (idx, n, li)
+                      with open(fn, "w") as f: f.write(line)
+                      y = top + li * lh + (lh - size) // 2
+                      fs.append("drawtext=fontfile=%s:textfile=%s:fontsize=%d:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=%d:enable='between(t,%.2f,%.2f)'" % (FONT, fn, size, y, a, b))
                   n += 1
               return fs
           def visual_filters(sc, with_source):
@@ -373,7 +441,7 @@ jobs:
                   title = (sc.get("title") or "").strip()
                   if title:
                       fn = "card_%d.txt" % si
-                      with open(fn, "w") as f: f.write(title)
+                      with open(fn, "w") as f: f.write(clean_text(title))
                       vf = "drawtext=fontfile=%s:textfile=%s:fontsize=%d:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2" % (FONT, fn, int(W * 0.045))
                   else:
                       vf = "null"

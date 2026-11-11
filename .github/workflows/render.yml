@@ -1,6 +1,6 @@
 name: BK EDITOR Server Turbo render
 
-# Workflow version: 6 (2026-11-11) — version 5 rendered end-to-end
+# Workflow version: 7 (2026-11-11) — version 5 rendered end-to-end
 # (run #8) but the video repeated a handful of clips (76 scenes, only
 # 16 different clips, one statue clip 22 times), used blurry 240p
 # sources, and showed box glyphs at caption line ends. Version 6
@@ -391,16 +391,16 @@ jobs:
           REPO: ${{ github.repository }}
           IDX: ${{ matrix.idx }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core > /dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core fonts-noto-core > /dev/null
           python3 - <<'PYEOF'
           import hashlib, json, os, subprocess, textwrap, urllib.request
           plan = json.load(open("job/plan.json"))
           idx = int(os.environ["IDX"])
           W, H, FPS = plan["width"], plan["height"], plan["fps"]
-          FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          FONT = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
           def clean_text(t):
               t = (t or "").replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"').replace("—", "-").replace("–", "-").replace("…", "...").replace(" ", " ")
-              return "".join(ch for ch in t if 32 <= ord(ch) < 127).strip()
+              return "".join(ch for ch in t if ch.isprintable() or ch == " ").strip()
           def cap_filters(scene_start, dur):
               fs = []
               if not plan.get("captionsOn"): return fs
@@ -412,7 +412,7 @@ jobs:
                   a = c["start"] - scene_start; b = c["end"] - scene_start
                   if b <= 0 or a >= dur: continue
                   a = max(0.0, a); b = min(dur, b)
-                  lines = textwrap.wrap(clean_text(c["text"]), 42)[:3]
+                  lines = textwrap.wrap(clean_text(c["text"]), 42, break_long_words=False, break_on_hyphens=False)[:3]
                   if not lines: continue
                   top = H - margin - len(lines) * lh
                   for li, line in enumerate(lines):
@@ -468,7 +468,12 @@ jobs:
                       cmd = ["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-ss", str(sc.get("seed", 0) % 15), "-t", "%.2f" % dur, "-i", local, "-vf", visual_filters(sc, True), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
                   else:
                       cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=%d:d=%.2f" % (W, H, FPS, dur), "-vf", visual_filters(sc, False), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
-              subprocess.run(cmd, check=True)
+              try:
+                  subprocess.run(cmd, check=True)
+              except subprocess.CalledProcessError as e:
+                  print("scene", si, "clip encode failed; using dark caption background:", e)
+                  fallback = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=%d:d=%.2f" % (W, H, FPS, dur), "-vf", visual_filters(sc, False) if sc["kind"] != "card" else "null", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out]
+                  subprocess.run(fallback, check=True)
               parts.append(out)
           with open("list.txt", "w") as f:
               for p in parts: f.write("file '%s'\n" % p)
@@ -520,9 +525,9 @@ jobs:
           TOTAL=$(python3 -c "import json; print(json.load(open('job/plan.json'))['total'])")
           if [ -n "$MUSIC" ]; then
             VOL=$(python3 -c "import json; print(json.load(open('job/settings.json')).get('musicGain', 0.16))")
-            ffmpeg -y -v error -i silent.mp4 -i "$A" -stream_loop -1 -i "$MUSIC" -filter_complex "[1:a]adelay=${MS}:all=1[voice];[2:a]volume=${VOL}[mus];[voice][mus]amix=inputs=2:duration=first:dropout_transition=0[a]" -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
+            ffmpeg -y -v error -i silent.mp4 -i "$A" -stream_loop -1 -i "$MUSIC" -filter_complex "[1:a]adelay=${MS}:all=1[voice];[2:a]volume=${VOL}[mus];[voice][mus]amix=inputs=2:duration=longest:dropout_transition=0,atrim=duration=${TOTAL}[a]" -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
           else
-            ffmpeg -y -v error -i silent.mp4 -i "$A" -filter_complex "[1:a]adelay=${MS}:all=1[voice]" -map 0:v -map "[voice]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
+            ffmpeg -y -v error -i silent.mp4 -i "$A" -filter_complex "[1:a]adelay=${MS}:all=1,apad,atrim=duration=${TOTAL}[voice]" -map 0:v -map "[voice]" -c:v copy -c:a aac -b:a 160k -movflags +faststart -t "$TOTAL" video.mp4
           fi
           ls -la video.mp4
           gh release upload "$TAG" --repo "$REPO" video.mp4 --clobber

@@ -1,6 +1,13 @@
 name: BK EDITOR Server Turbo render
 
-# Workflow version: 4 (2026-11-10) — version 3's transcribe step wrote
+# Workflow version: 5 (2026-11-10) — version 4's transcribe step got one
+# step further and died inside faster-whisper's own audio decoding:
+# TypeError: open() got an unexpected keyword argument 'metadata_errors'
+# (faster-whisper decodes file paths through PyAV, whose av.open arguments
+# differ between PyAV versions; run 42761189614). Version 5 removes PyAV
+# from the path entirely: the step decodes chunk.wav with Python's stdlib
+# wave module and hands Whisper a NumPy array, which needs no decoder.
+# Version 4 note — version 3's transcribe step wrote
 # START_S to $GITHUB_ENV, which only reaches LATER steps, so the Python
 # in the SAME step died instantly with KeyError: 'START_S' (all 6 chunks,
 # run 42758132182). Version 4 exports START_S inside the step's own shell
@@ -137,11 +144,16 @@ jobs:
           export START_S="$START"
           ffmpeg -y -v error -ss "$START" -t "$LENGTH" -i "$A" -vn -ac 1 -ar 16000 chunk.wav
           python3 - <<'PYEOF'
-          import json, os
+          import json, os, wave
+          import numpy as np
           from faster_whisper import WhisperModel
           idx = int(os.environ["IDX"]); start = float(os.environ.get("START_S") or (float(os.environ["LENGTH"]) * idx))
-          model = WhisperModel("small", device="cpu", compute_type="int8")
-          segments, info = model.transcribe("chunk.wav", beam_size=1, vad_filter=True)
+          w = wave.open("chunk.wav", "rb")
+          assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2), "chunk.wav is not 16kHz mono int16"
+          audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+          w.close()
+          model = WhisperModel(os.environ.get("BK_WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
+          segments, info = model.transcribe(audio, beam_size=1, vad_filter=True)
           out = [{"start": round(start + s.start, 2), "end": round(start + s.end, 2), "text": s.text.strip()} for s in segments if s.text.strip()]
           json.dump(out, open("seg-%d.json" % idx, "w"))
           print(idx, "->", len(out), "segments")
